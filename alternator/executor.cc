@@ -2764,6 +2764,16 @@ future<executor::request_return_type> executor::batch_write_item(client_state& c
     rjson::value& request_items = request["RequestItems"];
     auto start_time = std::chrono::steady_clock::now();
 
+    const auto maximum_batch_write_size = _proxy.data_dictionary().get_config().alternator_maximum_batch_write_size();
+
+    size_t total_items = 0;
+    for (auto it = request_items.MemberBegin(); it != request_items.MemberEnd(); ++it) {
+        total_items += it->value.Size();
+    }
+    if (total_items > maximum_batch_write_size) {
+        co_return api_error::validation(format("At most {} request items per batch write is supported (got {})", maximum_batch_write_size, total_items));
+    }
+
     std::vector<std::pair<schema_ptr, put_or_delete_item>> mutation_builders;
     mutation_builders.reserve(request_items.MemberCount());
     uint batch_size = 0;
