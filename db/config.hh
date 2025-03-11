@@ -441,6 +441,7 @@ public:
     named_value<uint32_t> alternator_timeout_in_ms;
     named_value<double> alternator_ttl_period_in_seconds;
     named_value<sstring> alternator_describe_endpoints;
+    named_value<uint32_t> alternator_maximum_batch_write_size;
 
     named_value<bool> abort_on_ebadf;
 
