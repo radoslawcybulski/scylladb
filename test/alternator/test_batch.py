@@ -456,6 +456,24 @@ def test_batch_write_item_too_many(test_table_sn):
             test_table_sn.name: [{'DeleteRequest': {'Key': {'p': p, 'c': i}}} for i in range(30)]
     })
 
+
+# done BatchWriteItem 
+def test_performance_1(test_table_ss):
+    p = random_string()
+    def column_iter():
+        yield 'p', p
+        yield 'c', p
+        #yield 'v', 'qwerty' * (1000000)
+    test_table_ss.meta.client.batch_write_item(RequestItems = {
+        test_table_ss.name: [{'PutRequest': {'Item': { k:v for k, v in column_iter() }}} for i in range(1)]
+    })
+    import time
+    time.sleep(1)
+    test_table_ss.meta.client.batch_write_item(RequestItems = {
+        test_table_ss.name: [{'DeleteRequest': {'Item': { k:v for k, v in column_iter() }}} for i in range(1)]
+    })
+
+
 # According to the DynamoDB documentation, a single BatchGetItem operation is
 # limited to retrieving up to 100 items or a total of 16 MB of data,
 # whichever is smaller. If we read less than those limits in a single
