@@ -465,12 +465,7 @@ def test_performance_1(test_table_ss):
         yield 'c', p
         #yield 'v', 'qwerty' * (1000000)
     test_table_ss.meta.client.batch_write_item(RequestItems = {
-        test_table_ss.name: [{'PutRequest': {'Item': { k:v for k, v in column_iter() }}} for i in range(1)]
-    })
-    import time
-    time.sleep(1)
-    test_table_ss.meta.client.batch_write_item(RequestItems = {
-        test_table_ss.name: [{'DeleteRequest': {'Item': { k:v for k, v in column_iter() }}} for i in range(1)]
+        test_table_ss.name: [{'PutRequest': {'Item': { k:v for k, v in column_iter() }}} for i in range(10000)]
     })
 
 
