@@ -457,16 +457,124 @@ def test_batch_write_item_too_many(test_table_sn):
     })
 
 
-# done BatchWriteItem 
-def test_performance_1(test_table_ss):
+def test_performance_batch_write_item_1(test_table_ss):
     p = random_string()
-    def column_iter():
+    def column_iter(i=0):
         yield 'p', p
-        yield 'c', p
+        yield 'c', f'{p}{i}'
         #yield 'v', 'qwerty' * (1000000)
     test_table_ss.meta.client.batch_write_item(RequestItems = {
-        test_table_ss.name: [{'PutRequest': {'Item': { k:v for k, v in column_iter() }}} for i in range(10000)]
+        test_table_ss.name: [{'PutRequest': {'Item': { k:v for k, v in column_iter(i) }}} for i in range(100000)]
     })
+def test_performance_batch_write_item_2(test_table_ss):
+    p = random_string()
+    def column_iter(i=0):
+        yield 'p', p
+        yield 'c', f'{p}{i}'
+        yield 'v', 'qwerty' * (1000000)
+    test_table_ss.meta.client.batch_write_item(RequestItems = {
+        test_table_ss.name: [{'PutRequest': {'Item': { k:v for k, v in column_iter() }}}]
+    })
+def test_performance_batch_write_item_3(test_table_ss):
+    p = random_string()
+    def column_iter(i=0):
+        yield 'p', p
+        yield 'c', f'{p}{i}'
+        for x in range(0, 50000):
+            yield f'v{x}', f'qwerty{x}'
+    test_table_ss.meta.client.batch_write_item(RequestItems = {
+        test_table_ss.name: [{'PutRequest': {'Item': { k:v for k, v in column_iter() }}}]
+    })
+def test_performance_create_table_1(dynamodb):
+    p = random_string()
+    from test.alternator.util import create_test_table
+
+    mx = 9000
+    key_schema = [ { 'AttributeName': 'pqwerty' * mx, 'KeyType': 'HASH' }, { 'AttributeName': 'qwerty' * mx, 'KeyType': 'RANGE' } ]
+    attr_def = [ { 'AttributeName': 'pqwerty' * mx, 'AttributeType': 'S' }, { 'AttributeName': 'qwerty' * mx, 'AttributeType': 'S' } ]
+    table = create_test_table(dynamodb, KeySchema=key_schema, AttributeDefinitions=attr_def)    
+    table.delete()
+def test_performance_put_item_1(test_table_ss):
+    p = random_string()
+    def column_iter(i=0):
+        yield 'p', p
+        yield 'c', f'{p}{i}'
+        yield 'v', 'qwerty' * (1000000)
+    test_table_ss.put_item(Item = { k:v for k, v in column_iter() })
+    test_table_ss.get_item(Key={ 'p': p, 'c': f'{p}0'})
+    test_table_ss.delete_item(Key={ 'p': p, 'c': f'{p}0'})
+def test_performance_put_item_2(test_table_ss):
+    p = random_string()
+    def column_iter(i=0):
+        yield 'p', p
+        yield 'c', f'{p}{i}'
+        for x in range(0, 50000):
+            yield f'v{x}', f'qwerty{x}'
+    test_table_ss.put_item(Item = { k:v for k, v in column_iter() })
+    test_table_ss.delete_item(Key={ 'p': p, 'c': f'{p}0'})
+def test_performance_update_item_1(test_table_ss):
+    p = random_string()
+    def column_iter(i=0):
+        yield 'p', p
+        yield 'c', f'{p}{i}'
+        yield 'v', 'qwerty' * (1000000)
+    test_table_ss.put_item(Item = { k:v for k, v in column_iter() })
+    mx = 1
+    test_table_ss.update_item(Key={ 'p': p, 'c': f'{p}0' },
+        ReturnValues='ALL_OLD')
+def test_performance_update_item_2(test_table_ss):
+    p = random_string()
+    def column_iter(i=0):
+        yield 'p', p
+        yield 'c', f'{p}{i}'
+        for x in range(0, 50000):
+            yield f'v{x}', f'qwerty{x}'
+    test_table_ss.put_item(Item = { k:v for k, v in column_iter() })
+    test_table_ss.update_item(Key={ 'p': p, 'c': f'{p}0' }, ReturnValues='ALL_OLD')
+def test_performance_scan_1(test_table_ss):
+    p = random_string()
+    def column_iter(i=0):
+        yield 'p', p
+        yield 'c', f'{p}{i}'
+        yield 'v', f'qwerty{i}'
+    test_table_ss.meta.client.batch_write_item(RequestItems = {
+        test_table_ss.name: [{'PutRequest': {'Item': { k:v for k, v in column_iter(i) }}} for i in range(50000)]
+    })
+    test_table_ss.scan(Limit=50000)
+def test_performance_query_1(test_table_ss):
+    p = random_string()
+    def column_iter(i=0):
+        yield 'p', p
+        yield 'c', f'{p}{i}'
+        yield 'v', f'qwerty{i}'
+    test_table_ss.meta.client.batch_write_item(RequestItems = {
+        test_table_ss.name: [{'PutRequest': {'Item': { k:v for k, v in column_iter(i) }}} for i in range(50000)]
+    })
+    test_table_ss.query(Limit=50000, KeyConditionExpression='p=:p',
+        ExpressionAttributeValues={':p': f'{p}5599'})
+def test_performance_tag_resource_1(test_table_ss):
+    descr = test_table_ss.meta.client.describe_table(TableName=test_table_ss.name)['Table']
+    arn =  descr['TableArn']
+    mx = 10
+    test_table_ss.meta.client.tag_resource(ResourceArn=arn, Tags=[
+        {"Key": f"k{x}", "Value": f"qwerty{x}" * 35} for x in range(0, mx)
+    ])
+    test_table_ss.meta.client.list_tags_of_resource(ResourceArn=arn)
+    test_table_ss.meta.client.untag_resource(ResourceArn=arn, TagKeys=[ f"k{x}" for x in range(0, mx)])
+def test_performance_update_time_to_live_1(test_table_ss):
+    p = random_string()
+    def column_iter(i=0):
+        yield 'p', p
+        yield 'c', f'{p}{i}'
+        for x in range(0, 50000):
+            yield f'v{x}', f'qwerty{x}'
+    test_table_ss.meta.client.batch_write_item(RequestItems = {
+        test_table_ss.name: [{'PutRequest': {'Item': { k:v for k, v in column_iter() }}}]
+    })
+    test_table_ss.meta.client.update_time_to_live(TableName=test_table_ss.name, TimeToLiveSpecification={'AttributeName': 'expiration', 'Enabled': True})
+    test_table_ss.meta.client.describe_time_to_live(TableName=test_table_ss.name)
+    test_table_ss.meta.client.update_time_to_live(TableName=test_table_ss.name, TimeToLiveSpecification={'AttributeName': 'expiration', 'Enabled': False})
+
 
 
 # According to the DynamoDB documentation, a single BatchGetItem operation is

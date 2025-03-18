@@ -65,7 +65,7 @@ def run_alternator_cmd(pid, dir):
     (cmd, env) = run_scylla_cmd(pid, dir)
     ip = run.pid_to_ip(pid)
     cmd += [
-        '--blocked-reactor-notify-ms', '5',
+        '--blocked-reactor-notify-ms', '1',
         '--alternator-address', ip,
         '--alternator-enforce-authorization', '1',
         '--alternator-write-isolation', 'always_use_lwt',
