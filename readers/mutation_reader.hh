@@ -129,7 +129,7 @@ public:
         size_t _buffer_size = 0;
         bool _close_required = false;
     protected:
-        size_t max_buffer_size_in_bytes = default_max_buffer_size_in_bytes();
+        const size_t max_buffer_size_in_bytes = default_max_buffer_size_in_bytes();
 
         // The stream producer should set this to indicate that there are no
         // more fragments to produce.
@@ -587,9 +587,9 @@ public:
     reader_permit& permit() { return _impl->_permit; }
     db::timeout_clock::time_point timeout() const noexcept { return _impl->timeout(); }
     void set_timeout(db::timeout_clock::time_point timeout) noexcept { _impl->set_timeout(timeout); }
-    void set_max_buffer_size(size_t size) {
-        _impl->max_buffer_size_in_bytes = size;
-    }
+    // void set_max_buffer_size(size_t size) {
+    //     _impl->max_buffer_size_in_bytes = size;
+    // }
     // Resolves with a pointer to the next fragment in the stream without consuming it from the stream,
     // or nullptr if there are no more fragments.
     // The returned pointer is invalidated by any other non-const call to this object.

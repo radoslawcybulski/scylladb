@@ -3052,7 +3052,7 @@ mutation_reader make_multishard_streaming_reader(distributed<replica::database>&
         auto rd = make_multishard_combining_reader_v2(seastar::make_shared<streaming_reader_lifecycle_policy>(db, table_id, compaction_time),
                 std::move(s), erm, std::move(permit), pr, ps, std::move(trace_state), fwd_mr, buffer_hint, read_ahead);
         if (multishard_reader_buffer_size) {
-            rd.set_max_buffer_size(*multishard_reader_buffer_size);
+            //rd.set_max_buffer_size(*multishard_reader_buffer_size);
         }
         return rd;
     });
@@ -3084,7 +3084,7 @@ mutation_reader make_multishard_streaming_reader(distributed<replica::database>&
         multishard_reader_buffer_hint(multishard_reader_buffer_size.has_value()),
         read_ahead);
     if (multishard_reader_buffer_size) {
-        rd.set_max_buffer_size(*multishard_reader_buffer_size);
+        //rd.set_max_buffer_size(*multishard_reader_buffer_size);
     }
     return rd;
 }

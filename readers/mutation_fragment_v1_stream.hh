@@ -123,9 +123,9 @@ public:
         return _reader.fast_forward_to(std::move(pr));
     }
 
-    void set_max_buffer_size(size_t size) {
-        _reader.set_max_buffer_size(size);
-    }
+    // void set_max_buffer_size(size_t size) {
+    //     _reader.set_max_buffer_size(size);
+    // }
     future<> fill_buffer() {
         return _reader.fill_buffer();
     }
