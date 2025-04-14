@@ -44,6 +44,8 @@ def env(test_path, distinct_id=None):
     ensuring that the coverage report will include all these different runs,
     instead of whatever happened to run last time (overriding previous results).
     """
+    print(f'using profile {__raw_profiling_filename(test_path, distinct_id)}')
+    print('QWERTY 4')
     return {"LLVM_PROFILE_FILE": __raw_profiling_filename(test_path, distinct_id)}
 
 
@@ -67,7 +69,7 @@ def run(args, executable=None, distinct_id=None):
         pass # allow process to be shut down with ^C
 
 
-def generate_coverage_report(path="build/coverage/test", name="tests", input_files=None, verbose=0):
+def generate_coverage_report(path="testlog/coverage", name="tests", input_files=None, verbose=0):
     """Generate a html coverage report from the given profiling data
 
     Arguments:
@@ -103,35 +105,36 @@ def generate_coverage_report(path="build/coverage/test", name="tests", input_fil
 
         Defaults to 0 (False).
     """
+    path="testlog/coverage"
     verbose = int(verbose)
     input_file_re_str = rf"(.+)\.profraw(\.{__DISTINCT_ID_RE})?"
     input_file_re = re.compile(input_file_re_str)
     test_executables = []
 
     def maybe_print(msg):
-        if verbose:
-            print(msg)
+        #if verbose:
+        print(msg)
 
-    if input_files:
-        maybe_print("Using input_files as input for the report")
-        profraw_files = input_files
-        for file in profraw_files:
-            dirname, basename = os.path.split(file)
-            match = re.fullmatch(input_file_re, basename)
-            if match is None:
-                print(f"Error: input file {basename} doesn't match the expected input file naming pattern {input_file_re_str}, skipping it")
+    # if input_files:
+    #     maybe_print("Using input_files as input for the report")
+    #     profraw_files = input_files
+    #     for file in profraw_files:
+    #         dirname, basename = os.path.split(file)
+    #         match = re.fullmatch(input_file_re, basename)
+    #         if match is None:
+    #             print(f"Error: input file {basename} doesn't match the expected input file naming pattern {input_file_re_str}, skipping it")
 
-            test_executables.append(os.path.join(dirname, match.group(1)))
-    else:
-        maybe_print(f"Scanning {path} for input files matching {input_file_re_str}")
-        profraw_files = []
-        for root, dirs, files in os.walk(path):
-            for file in files:
-                match = re.fullmatch(input_file_re, file)
-                if match is not None:
-                    profraw_files.append(os.path.join(root, file))
-                    test_executables.append(os.path.join(root, match.group(1)))
-        maybe_print(f"Found {len(profraw_files)} input files")
+    #         test_executables.append(os.path.join(dirname, match.group(1)))
+    # else:
+    maybe_print(f"Scanning {path} for input files matching {input_file_re_str}")
+    profraw_files = []
+    for root, dirs, files in os.walk(path):
+        for file in files:
+            match = re.fullmatch(input_file_re, file)
+            if match is not None:
+                profraw_files.append(os.path.join(root, file))
+                test_executables.append(os.path.join(root, match.group(1)))
+    maybe_print(f"Found {len(profraw_files)} input files")
 
     if not profraw_files:
         sys.exit("Error: couldn't find any raw profiling data files, can't generate coverage report")

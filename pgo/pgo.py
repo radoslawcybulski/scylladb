@@ -387,6 +387,7 @@ async def start_node(executable: PathLike, cluster_workdir: PathLike, addr: str,
     # These paths are relative to cluster_workdir.
     # The directory change to it happens via the cwd=cluster_workdir in run()
     llvm_profile_file = f"{addr}-%m.profraw"
+    print('QWERTY 5')
     scylla_workdir = f"{addr}"
     logfile = f"{addr}.log"
     command = [

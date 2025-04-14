@@ -128,13 +128,16 @@ class TestSuite(ABC):
             self.disabled_tests.update(skip_in_m - run_in_m)
         # environment variables that should be the base of all processes running in this suit
         self.base_env = {}
-        if self.need_coverage():
-            # Set the coverage data from each instrumented object to use the same file (and merged into it with locking)
-            # as long as we don't need test specific coverage data, this looks sufficient. The benefit of doing this in
-            # this way is that the storage will not be bloated with coverage files (each can weigh 10s of MBs so for several
-            # thousands of tests it can easily reach 10 of GBs)
-            # ref: https://clang.llvm.org/docs/SourceBasedCodeCoverage.html#running-the-instrumented-program
-            self.base_env["LLVM_PROFILE_FILE"] = str(self.log_dir / "coverage" / self.name / "%m.profraw")
+
+        print(f'QWERTY 1 {str(self.log_dir / "coverage" / self.name / "%m.profraw")}')
+        # if self.need_coverage():
+        #     print('QWERTY 2')
+        #     # Set the coverage data from each instrumented object to use the same file (and merged into it with locking)
+        #     # as long as we don't need test specific coverage data, this looks sufficient. The benefit of doing this in
+        #     # this way is that the storage will not be bloated with coverage files (each can weigh 10s of MBs so for several
+        #     # thousands of tests it can easily reach 10 of GBs)
+        #     # ref: https://clang.llvm.org/docs/SourceBasedCodeCoverage.html#running-the-instrumented-program
+        self.base_env["LLVM_PROFILE_FILE"] = str(self.log_dir / "coverage" / self.name / "%m.profraw")
 
 
     # Generate a unique ID for `--repeat`ed tests
@@ -288,6 +291,7 @@ class TestSuite(ABC):
             await asyncio.gather(*pending, return_exceptions=True)
             raise
     def need_coverage(self):
+        print(f'QWERTY QQ {bool(self.options.coverage)} {self.options.coverage and self.mode in self.options.coverage_modes} {bool(self.cfg.get("coverage",True))}')
         return self.options.coverage and (self.mode in self.options.coverage_modes) and bool(self.cfg.get("coverage",True))
 
 

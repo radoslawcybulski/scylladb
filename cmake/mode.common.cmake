@@ -236,14 +236,25 @@ if(profdata_file)
   # taken.
   # We allow stale profiles, so these warnings are just noise to us.
   # Let's silence them.
-  string(APPEND CMAKE_CXX_FLAGS " -Wno-backend-plugin")
-  string(APPEND CMAKE_CXX_FLAGS " -fprofile-use=\"${profdata_file}\"")
+  string(APPEND CMAKE_CXX_FLAGS_DEBUG " -Wno-backend-plugin -fprofile-use=\"${profdata_file}\"")
+  string(APPEND CMAKE_CXX_FLAGS_DEV " -Wno-backend-plugin -fprofile-use=\"${profdata_file}\"")
+  string(APPEND CMAKE_CXX_FLAGS_RELWITHDEBINFO " -Wno-backend-plugin -fprofile-use=\"${profdata_file}\"")
+  string(APPEND CMAKE_CXX_FLAGS_SANITIZE " -Wno-backend-plugin -fprofile-use=\"${profdata_file}\"")
 endif()
 
 if(pgo_opts)
-  string(APPEND CMAKE_CXX_FLAGS "${pgo_opts}")
-  string(APPEND CMAKE_EXE_LINKER_FLAGS "${pgo_opts}")
-  string(APPEND CMAKE_SHARED_LINKER_FLAGS "${pgo_opts}")
+  string(APPEND CMAKE_CXX_FLAGS_DEBUG "${pgo_opts}")
+  string(APPEND CMAKE_EXE_LINKER_FLAGS_DEBUG "${pgo_opts}")
+  string(APPEND CMAKE_SHARED_LINKER_FLAGS_DEBUG "${pgo_opts}")
+  string(APPEND CMAKE_CXX_FLAGS_DEV "${pgo_opts}")
+  string(APPEND CMAKE_EXE_LINKER_FLAGS_DEV "${pgo_opts}")
+  string(APPEND CMAKE_SHARED_LINKER_FLAGS_DEV "${pgo_opts}")
+  string(APPEND CMAKE_CXX_FLAGS_RELWITHDEBINFO "${pgo_opts}")
+  string(APPEND CMAKE_EXE_LINKER_FLAGS_RELWITHDEBINFO "${pgo_opts}")
+  string(APPEND CMAKE_SHARED_LINKER_FLAGS_RELWITHDEBINFO "${pgo_opts}")
+  string(APPEND CMAKE_CXX_FLAGS_SANITIZE "${pgo_opts}")
+  string(APPEND CMAKE_EXE_LINKER_FLAGS_SANITIZE "${pgo_opts}")
+  string(APPEND CMAKE_SHARED_LINKER_FLAGS_SANITIZE "${pgo_opts}")
 endif()
 
 # Force SHA1 build-id generation

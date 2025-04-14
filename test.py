@@ -665,6 +665,7 @@ async def process_coverage(options):
                                   data = Stats("Coverage Processing Stats", 0, 0))
 
     for suite in list(ran_suites):
+        print('QWERTY 6')
         coverage_path = suite_coverage_path(suite)
         if not coverage_path.exists():
             logger.warning(f"Coverage dir for suite '{suite.name}' in mode '{suite.mode}' wasn't found, common reasons:\n\t"

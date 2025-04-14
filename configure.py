@@ -427,7 +427,7 @@ modes = {
         'stack-usage-threshold': 1024*40,
         'optimization-level': 'g',
         'per_src_extra_cxxflags': {},
-        'cmake_build_type': 'Debug',
+        'cmake_build_type': 'Dev',
         'can_have_debug_info': True,
         'build_seastar_shared_libs': False,
         'default': False,
@@ -1990,6 +1990,7 @@ def configure_abseil(build_dir, mode, mode_config):
     cxx_flags = mode_config['cxxflags']
     if '-DSANITIZE' in cxx_flags:
         abseil_cflags += ' -fsanitize=address -fsanitize=undefined -fno-sanitize=vptr'
+        print(f'abseil_cflags = {abseil_cflags}')
 
     # We want to "undo" coverage for abseil if we have it enabled, as we are not
     # interested in the coverage of the abseil library. these flags were previously

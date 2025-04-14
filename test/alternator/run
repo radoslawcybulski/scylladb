@@ -37,6 +37,8 @@ if len(sys.argv) > 1 and sys.argv[1] == '--release':
 else:
     run_scylla_cmd = run.run_scylla_cmd
 
+os.environ['LLVM_PROFILE_FILE']='/tmp/code-coverage/cc-%p-%m.profraw'
+print('QWERTY 3')
 print('Scylla is: ' + run.find_scylla() + '.')
 
 extra_scylla_options = []
