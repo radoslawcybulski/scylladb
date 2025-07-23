@@ -2315,6 +2315,10 @@ def write_build_file(f,
 
     for mode in build_modes:
         modeval = modes[mode]
+        seastar_lib_ext = 'so' if modeval['build_seastar_shared_libs'] else 'a'
+        seastar_dep = f'$builddir/{mode}/seastar/libseastar.{seastar_lib_ext}'
+        seastar_testing_dep = f'$builddir/{mode}/seastar/libseastar_testing.{seastar_lib_ext}'
+        abseil_dep = ' '.join(f'$builddir/{mode}/abseil/{lib}' for lib in abseil_libs)
         fmt_lib = 'fmt'
         f.write(textwrap.dedent('''\
             cxx_ld_flags_{mode} = {cxx_ld_flags}
@@ -2328,7 +2332,7 @@ def write_build_file(f,
               description = CXX $out
               depfile = $out.d
             rule cxx_build_precompiled_header.{mode}
-              command = $cxx -MD -MT $out -MF $out.d {seastar_cflags} $cxxflags_{mode} $cxxflags $obj_cxxflags -c -o $out $in -Winvalid-pch -fpch-instantiate-templates -Xclang -emit-pch
+              command = $cxx -MD -MT $out -MF $out.d {seastar_cflags} $cxxflags_{mode} $cxxflags $obj_cxxflags -c -o $out $in -Winvalid-pch -fpch-instantiate-templates -Xclang -emit-pch -DSCYLLA_USE_PRECOMPILED_HEADER
               description = CXX-PRECOMPILED-HEADER $out
               depfile = $out.d
             rule cxx_with_pch.{mode}
@@ -2381,8 +2385,9 @@ def write_build_file(f,
                         && touch $out
               description = RUST_LIB $out
 
-            build $builddir/{mode}/stdafx.hh.pch: cxx_build_precompiled_header.{mode} stdafx.hh | {profile_dep}
-            ''').format(mode=mode, antlr3_exec=args.antlr3_exec, fmt_lib=fmt_lib, test_repeat=args.test_repeat, test_timeout=args.test_timeout, profile_dep=modeval.get('profile_target', ""), **modeval))
+            build $builddir/{mode}/stdafx.hh.pch: cxx_build_precompiled_header.{mode} stdafx.hh | {profile_dep} {seastar_dep} {abseil_dep} {gen_headers_dep} {pch_dep}
+            ''').format(mode=mode, antlr3_exec=args.antlr3_exec, fmt_lib=fmt_lib, test_repeat=args.test_repeat, test_timeout=args.test_timeout, profile_dep=modeval.get('profile_target', ""), 
+                        seastar_dep=seastar_dep, abseil_dep=abseil_dep, gen_headers_dep=gen_headers_dep, pch_dep=pch_dep, **modeval))
         f.write(
             'build {mode}-build: phony {artifacts} {wasms}\n'.format(
                 mode=mode,
@@ -2411,7 +2416,6 @@ def write_build_file(f,
         # object code. And we enable LTO when linking the main Scylla executable, while disable
         # it when linking anything else.
 
-        seastar_lib_ext = 'so' if modeval['build_seastar_shared_libs'] else 'a'
         for binary in sorted(build_artifacts):
             if modeval['is_profile'] and binary != "scylla":
                 # Just to avoid clutter in build.ninja
@@ -2441,9 +2445,6 @@ def write_build_file(f,
                 objs.append(f'$builddir/{parent_mode}/rust-{parent_mode}/librust_combined.a')
 
             do_lto = modes[mode]['has_lto'] and binary in lto_binaries
-            seastar_dep = f'$builddir/{mode}/seastar/libseastar.{seastar_lib_ext}'
-            seastar_testing_dep = f'$builddir/{mode}/seastar/libseastar_testing.{seastar_lib_ext}'
-            abseil_dep = ' '.join(f'$builddir/{mode}/abseil/{lib}' for lib in abseil_libs)
             seastar_testing_libs = f'$seastar_testing_libs_{mode}'
 
             local_libs = f'$seastar_libs_{mode} $libs'
@@ -2564,7 +2565,7 @@ def write_build_file(f,
             abseil_dep = ' '.join(f'$builddir/{mode}/abseil/{lib}' for lib in abseil_libs)
             cxx_cmd = 'cxx_with_pch' if obj in compiles_with_pch else 'cxx'
             pch_dep = f'$builddir/{mode}/stdafx.hh.pch' if obj in compiles_with_pch else ''
-            f.write(f'build {obj}: {cxx_cmd}.{mode} {src} | {profile_dep} || {seastar_dep} {abseil_dep} {gen_headers_dep} {pch_dep}\n')
+            f.write(f'build {obj}: {cxx_cmd}.{mode} {src} | {profile_dep} {seastar_dep} {abseil_dep} {gen_headers_dep} {pch_dep}\n')
             if src in modeval['per_src_extra_cxxflags']:
                 f.write('    cxxflags = {seastar_cflags} $cxxflags $cxxflags_{mode} {extra_cxxflags}\n'.format(mode=mode, extra_cxxflags=modeval["per_src_extra_cxxflags"][src], **modeval))
         for swagger in swaggers:
