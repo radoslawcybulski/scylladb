@@ -59,6 +59,8 @@
 #include "alternator/extract_from_attrs.hh"
 #include "types/types.hh"
 #include "db/system_keyspace.hh"
+#include "/home/y/work/coz/include/coz.h"
+#include <seastar/util/defer.hh>
 
 using namespace std::chrono_literals;
 
@@ -4381,6 +4383,12 @@ static rjson::value describe_item(schema_ptr schema,
 }
 
 future<executor::request_return_type> executor::get_item(client_state& client_state, tracing::trace_state_ptr trace_state, service_permit permit, rjson::value request) {
+    COZ_BEGIN("alternator_get_item");
+    
+    auto _defer = defer([&]() {
+        COZ_END("alternator_get_item");
+    });
+    
     _stats.api_operations.get_item++;
     auto start_time = std::chrono::steady_clock::now();
     elogger.trace("Getting item {}", request);

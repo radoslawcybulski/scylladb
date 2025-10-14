@@ -402,7 +402,7 @@ modes = {
         'optimization-level': '2',
         'per_src_extra_cxxflags': {},
         'cmake_build_type': 'Dev',
-        'can_have_debug_info': False,
+        'can_have_debug_info': True,
         'build_seastar_shared_libs': True,
         'default': True,
         'description': 'a mode with no optimizations and no debug checks, optimized for fast build times, used for development',
@@ -2181,7 +2181,7 @@ def get_extra_cxxflags(mode, mode_config, cxx, debuginfo):
     cxxflags.append(f'-DSCYLLA_BUILD_MODE={mode}')
 
     if debuginfo and mode_config['can_have_debug_info']:
-        cxxflags += ['-g', '-gz']
+        cxxflags += ['-g', '-gdwarf-3']
 
     if 'clang' in cxx:
         # Since AssignmentTracking was enabled by default in clang

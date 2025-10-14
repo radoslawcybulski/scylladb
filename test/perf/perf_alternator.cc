@@ -404,14 +404,17 @@ void workload_main(const test_config& c) {
         throw std::runtime_error(fmt::format("unknown workload '{}'", c.workload));
     }
     fun_t fun = it->second;
+    size_t count = 0;
 
     auto results = time_parallel([&] {
         static thread_local auto sharded_cli_pool = make_client_pool(c); // for simplicity never closed as it lives for the whole process runtime
         static thread_local auto cli_iter = -1;
         auto seq = tests::random::get_int<uint64_t>(c.partitions - 1);
+        ++count;
         return fun(c, sharded_cli_pool[++cli_iter % c.concurrency], seq);
     }, c.concurrency, c.duration_in_seconds, c.operations_per_shard, !c.continue_after_error);
 
+    std::cout << "Completed after " << count << " iterations.\n";
     std::cout << aggregated_perf_results(results) << std::endl;
 }
 
