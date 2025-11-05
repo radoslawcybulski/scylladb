@@ -353,14 +353,14 @@ rjson::value json_key_column_value(bytes_view cell, const column_definition& col
         // FIXME: use specialized Alternator number type, not the more
         // general "decimal_type". A dedicated type can be more efficient
         // in storage space and in parsing speed.
-        auto s = to_json_string(*decimal_type, bytes(cell));
+        auto s = to_json_string(*decimal_type, cell);
         return rjson::from_string(s);
     } else {
         // Support for arbitrary key types is useful for parsing values of virtual tables,
         // which can involve any type supported by Scylla.
         // In order to guarantee that the returned type is parsable by alternator clients,
         // they are represented simply as strings.
-        return rjson::from_string(column.type->to_string(bytes(cell)));
+        return rjson::from_string(column.type->to_string(cell));
     }
 }
 
