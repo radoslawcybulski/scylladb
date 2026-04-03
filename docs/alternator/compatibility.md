@@ -261,6 +261,12 @@ is different, or can be configured in Alternator:
   this limit defaults to 100 but can be changed with 
   the `alternator_max_items_in_batch_write` configuration parameter.
 
+* DynamoDB limits each BatchGetItem request to 100 items and 16 MB of
+  response data. In Alternator, the item count limit defaults to 100 but
+  can be changed with the `alternator_max_items_in_batch_read` configuration
+  parameter. The 16 MB response size limit is enforced using approximate
+  item sizes; items exceeding the limit are returned as UnprocessedKeys.
+
 * DynamoDB limits the name of tables, GSIs and LSIs, to 255 characters each.
   In Alternator, the limit is different:
     * A table's name is limited to 192 characters.
