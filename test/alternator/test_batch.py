@@ -13,9 +13,10 @@ import time
 
 import pytest
 import urllib3
+import itertools
 from botocore.exceptions import ClientError, HTTPClientError
 
-from test.alternator.util import random_string, full_query, multiset, scylla_inject_error
+from test.alternator.util import random_string, full_query, multiset, scylla_inject_error, is_aws, scylla_config_temporary
 
 
 # Test ensuring that items inserted by a batched statement can be properly extracted
@@ -566,3 +567,153 @@ def test_batch_get_item_full_failure(scylla_only, dynamodb, rest_api, test_table
     with scylla_inject_error(rest_api, "alternator_batch_get_item", one_shot=False):
         with pytest.raises(ClientError, match="InternalServerError"):
             test_table_sn.meta.client.batch_get_item(RequestItems = to_read)
+
+# DynamoDB limits the number of items requested by a BatchGetItem operation
+# to 100. Exceeding this limit results in a ValidationException error.
+# Default limit for ScyllaDB is also set to 100, so we check against 105.
+# Reproduces #5944
+@pytest.mark.xfail(reason="temporary")
+def test_batch_get_item_too_many(test_table_sn):
+    p = random_string()
+    # Try to read 100 items (the default 100 limit). Items don't have to exist - non existing items are ignored.
+    test_table_sn.meta.client.batch_get_item(RequestItems = {
+        test_table_sn.name: {'Keys': [{'p': p, 'c': i} for i in range(100)], 'ConsistentRead': True }
+    })
+    # Try to read 101 items (more than the default 100 limit).
+    # The items don't need to exist - the limit is checked before reading.
+    with pytest.raises(ClientError, match='ValidationException.*length'):
+        test_table_sn.meta.client.batch_get_item(RequestItems = {
+            test_table_sn.name: {'Keys': [{'p': p, 'c': i} for i in range(101)], 'ConsistentRead': True }
+    })
+
+# Test that BatchGetItem returns items exceeding the 16 MB response size
+# limit as UnprocessedKeys, not as an error. We write 50 items each about
+# 400 KB (totaling ~20 MB), then verify the client can loop over
+# UnprocessedKeys to read all items.
+# Each item is from different partition, we don't know which will be returned and which will be unprocessed
+# We will keep trying until we read all items (UnprocessedKeys is empty), where set of retrieved items must be the same as items we wrote
+# Reproduces #5944
+@pytest.mark.xfail(reason="temporary")
+def test_batch_get_item_response_size_limit(test_table_sn):
+    p = random_string()
+    count = 50
+    write_step = 30
+    keys = [{'p': p + str(i), 'c': i} for i in range(count)]
+    # Each item is roughly 400 KB (400,000 bytes of content), so 50 items
+    # total about 20 MB which exceeds the 16 MB response limit.
+    # We have the same limit on write, so we need split writes as well.
+    long_content = random_string(100) * 4000
+
+    for start in range(0, count, write_step):
+        with test_table_sn.batch_writer() as batch:
+            for k in keys[start:start + write_step]:
+                batch.put_item(Item={'p': k['p'], 'c': k['c'], 'content': long_content})
+    responses = []
+    to_read = { test_table_sn.name: {'Keys': keys, 'ConsistentRead': True } }
+    some_keys_were_unprocessed = False
+    while to_read:
+        reply = test_table_sn.meta.client.batch_get_item(RequestItems = to_read)
+        assert 'UnprocessedKeys' in reply
+        to_read = reply['UnprocessedKeys']
+        some_keys_were_unprocessed = some_keys_were_unprocessed or len(to_read) > 0
+        assert 'Responses' in reply
+        assert test_table_sn.name in reply['Responses']
+        responses.extend(reply['Responses'][test_table_sn.name])
+    assert some_keys_were_unprocessed
+    assert multiset(responses) == multiset([{'p': k['p'], 'c': k['c'], 'content': long_content} for k in keys])
+
+# Test that BatchGetItem returns items exceeding the 16 MB response size
+# limit as UnprocessedKeys, not as an error. We write 70 items each about
+# 400 KB (totaling ~20 MB), then verify the client can loop over
+# UnprocessedKeys to read all items.
+# All items are split into 3 partitions (as our reading algorithm process keys by partitions) and
+# we test here that when oversize happens midway reading a lot of items from one partition,
+# we will get some items (but not all) from that partition and next time - rest of them.
+# We will keep trying until we read all items (UnprocessedKeys is empty), where set of retrieved items must be the same as items we wrote
+# Reproduces #5944
+@pytest.mark.xfail(reason="temporary")
+def test_batch_get_item_response_size_limit_only_few_partitions(test_table_sn):
+    p = random_string()
+    count = 70
+    partitions = 3
+    write_step = 30
+    keys = [{'p': p + str(i % partitions), 'c': i} for i in range(count)]
+    # Each item is roughly 400 KB (400,000 bytes of content), so 70 items
+    # total about 28 MB which exceeds the 16 MB response limit.
+    # The size is picked in such a way that after oversize we should get
+    # one partition fully, half of another and nothing of third one.
+    # After second try we should get the rest of second partition and all third one, nothing from first.
+    long_content = random_string(100) * 4000
+
+    for start in range(0, count, write_step):
+        with test_table_sn.batch_writer() as batch:
+            for k in keys[start:start + write_step]:
+                batch.put_item(Item={'p': k['p'], 'c': k['c'], 'content': long_content})
+
+    responses = []
+    to_read = { test_table_sn.name: {'Keys': keys, 'ConsistentRead': True } }
+    some_keys_were_unprocessed = False
+    total_reads = 0
+    while to_read:
+        reply = test_table_sn.meta.client.batch_get_item(RequestItems = to_read)
+        total_reads += 1
+        assert 'UnprocessedKeys' in reply
+        to_read = reply['UnprocessedKeys']
+        some_keys_were_unprocessed = some_keys_were_unprocessed or len(to_read) > 0
+        assert 'Responses' in reply
+        assert test_table_sn.name in reply['Responses']
+        responses.extend(reply['Responses'][test_table_sn.name])
+    assert total_reads == 2
+    assert some_keys_were_unprocessed
+    assert multiset(responses) == multiset([{'p': k['p'], 'c': k['c'], 'content': long_content} for k in keys])
+
+# Test that BatchGetItem returns items exceeding the 16 MB response size
+# limit as UnprocessedKeys, not as an error. We write 50 items each about
+# 400 KB (totaling ~20 MB), then verify the client can loop over
+# UnprocessedKeys to read all items.
+# All items are from the same partition, we should get part of them in first response and rest in second one, but we don't know which ones will be returned and which ones will be unprocessed.
+# We will keep trying until we read all items (UnprocessedKeys is empty), where set of retrieved items must be the same as items we wrote
+# Reproduces #5944
+@pytest.mark.xfail(reason="temporary")
+def test_batch_get_item_response_size_limit_single_partition(test_table_sn):
+    p = random_string()
+    count = 50
+    write_step = 30
+    keys = [{'p': p, 'c': i} for i in range(count)]
+    # Each item is roughly 400 KB (400,000 bytes of content), so 50 items
+    # total about 20 MB which exceeds the 16 MB response limit.
+    # The size is picked in such a way that after oversize we should get
+    # part of the items in first response and the rest in second response.
+    # After second try we should get the rest of the items.
+
+    long_content = random_string(100) * 4000
+    # we need to write in two batches as otherwise we hit max batch write size limit.
+    for start in range(0, count, write_step):
+        with test_table_sn.batch_writer() as batch:
+            for k in keys[start:start + write_step]:
+                batch.put_item(Item={'p': k['p'], 'c': k['c'], 'content': long_content})
+    responses = []
+    to_read = { test_table_sn.name: {'Keys': keys, 'ConsistentRead': True } }
+    some_keys_were_unprocessed = False
+    total_reads = 0
+    while to_read:
+        reply = test_table_sn.meta.client.batch_get_item(RequestItems = to_read)
+        total_reads += 1
+        assert 'UnprocessedKeys' in reply
+        to_read = reply['UnprocessedKeys']
+        some_keys_were_unprocessed = some_keys_were_unprocessed or len(to_read) > 0
+        assert 'Responses' in reply
+        assert test_table_sn.name in reply['Responses']
+        responses.extend(reply['Responses'][test_table_sn.name])
+    # we must finish in 2 reads (due to size limit and item sizes)
+    assert total_reads == 2
+    assert some_keys_were_unprocessed
+    assert multiset(responses) == multiset([{'p': k['p'], 'c': k['c'], 'content': long_content} for k in keys])
+
+# Test that an empty RequestItems in BatchGetItem results in a
+# ValidationException, not a silent success.
+# Reproduces #5944
+@pytest.mark.xfail(reason="temporary")
+def test_batch_get_item_empty(test_table_sn):
+    with pytest.raises(ClientError, match='ValidationException'):
+        test_table_sn.meta.client.batch_get_item(RequestItems = {})
