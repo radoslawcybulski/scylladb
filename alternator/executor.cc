@@ -50,6 +50,7 @@
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/sleep.hh>
 #include <seastar/core/loop.hh>
+#include <seastar/core/semaphore.hh>
 #include <seastar/coroutine/maybe_yield.hh>
 #include <boost/range/algorithm/find_end.hpp>
 #include <unordered_set>
@@ -4800,13 +4801,18 @@ static void check_big_object(const rjson::value& val, int& size_left) {
 }
 
 future<executor::request_return_type> executor::batch_get_item(client_state& client_state, tracing::trace_state_ptr trace_state, service_permit permit, rjson::value request) {
-    // FIXME: In this implementation, an unbounded batch size can cause
-    // unbounded response JSON object to be buffered in memory, unbounded
-    // parallelism of the requests, and unbounded amount of non-preemptable
-    // work in the following loops. So we should limit the batch size, and/or
-    // the response size, as DynamoDB does.
+    // DynamoDB limits BatchGetItem to 100 items and 16 MB response size.
+    // We enforce both limits, returning excess items as UnprocessedKeys.
     _stats.api_operations.batch_get_item++;
+    // Validate RequestItems exists and is a non-empty object.
+    // Use get_member() for validation, then take a mutable reference
+    // because we later store pointers into the key values and may move them.
+    get_member(request, "RequestItems", "BatchGetItem content");
     rjson::value& request_items = request["RequestItems"];
+    validate_is_object(request_items, "RequestItems");
+    if (request_items.ObjectEmpty()) {
+        co_return api_error::validation("RequestItems can't be empty");
+    }
     auto start_time = std::chrono::steady_clock::now();
     // We need to validate all the parameters before starting any asynchronous
     // query, and fail the entire request on any parse error. So we parse all
@@ -4815,6 +4821,7 @@ future<executor::request_return_type> executor::batch_get_item(client_state& cli
     // each table_requests we further group together all reads going to the
     // same partition, so we can later send them together.
     bool should_add_rcu = rcu_consumed_capacity_counter::should_add_capacity(request);
+    const auto maximum_batch_read_size = _proxy.data_dictionary().get_config().alternator_max_items_in_batch_read();
     struct table_requests {
         schema_ptr schema;
         db::consistency_level cl;
@@ -4855,8 +4862,12 @@ future<executor::request_return_type> executor::batch_get_item(client_state& cli
             rs.add(key);
             check_key(key, rs.schema);
         }
-        batch_size += rs.requests.size();
+        batch_size += keys.Size();
         requests.emplace_back(std::move(rs));
+    }
+    if (batch_size > maximum_batch_read_size) {
+        co_return api_error::validation(fmt::format("Invalid length of BatchGetItem command, got {} items, "
+            "maximum is {} (from configuration variable alternator_max_items_in_batch_read)", batch_size, maximum_batch_read_size));
     }
 
     for (const table_requests& tr : requests) {
@@ -4866,9 +4877,29 @@ future<executor::request_return_type> executor::batch_get_item(client_state& cli
     _stats.api_operations.batch_get_item_batch_total += batch_size;
     _stats.api_operations.batch_get_item_histogram.add(batch_size);
     // If we got here, all "requests" are valid, so let's start the
-    // requests for the different partitions all in parallel.
+    // requests for the different partitions, with bounded parallelism
+    // to avoid overwhelming the system with too many concurrent reads.
+    static constexpr size_t max_concurrent_reads = 32;
+    // DynamoDB limits BatchGetItem response to 16 MB. We track the
+    // approximate response size and route excess items to UnprocessedKeys.
+    static constexpr uint64_t max_response_size = 16 * 1024 * 1024;
+    seastar::semaphore read_concurrency_sem(max_concurrent_reads);
     std::vector<future<std::vector<rjson::value>>> response_futures;
     std::vector<uint64_t> consumed_rcu_half_units_per_table(requests.size());
+    // Track the approximate DynamoDB-style item size for each partition read,
+    // so we can enforce the 16 MB response size limit during collection.
+    // Reserve to avoid invalidating references captured by item_callback.
+    // First value is size of all items read for the same partition.
+    // Second value is number of items that should be returned to the user from that partition.
+    // If it's less than total item count for that partition it means we oversized
+    // and we need to drop remaining items.
+    std::vector<std::pair<uint64_t, size_t>> per_query_item_sizes;
+    per_query_item_sizes.reserve(batch_size);
+    // We also track the cumulative approximate response size and route
+    // items exceeding the 16 MB limit to UnprocessedKeys.
+    // We will use this flag to skip initiating of further reading, if possible.
+    uint64_t processing_total_response_size = 0;
+    
     for (size_t i = 0; i < requests.size(); i++) {
         const table_requests& rs = requests[i];
         bool is_quorum = rs.cl == db::consistency_level::LOCAL_QUORUM;
@@ -4892,20 +4923,34 @@ future<executor::request_return_type> executor::batch_get_item(client_state& cli
             auto command = ::make_lw_shared<query::read_command>(rs.schema->id(), rs.schema->version(), partition_slice, _proxy.get_max_result_size(partition_slice),
                     query::tombstone_limit(_proxy.get_tombstone_limit()));
             command->allow_limit = db::allow_per_partition_rate_limit::yes;
-            const auto item_callback = [is_quorum, per_table_stats, &rcus_per_table = consumed_rcu_half_units_per_table[i]](uint64_t size) {
+            per_query_item_sizes.push_back({ 0, 0 });
+            const auto item_callback = [is_quorum, per_table_stats, &rcus_per_table = consumed_rcu_half_units_per_table[i], &query_size = per_query_item_sizes.back(), &processing_total_response_size](uint64_t size) {
                 rcus_per_table += rcu_consumed_capacity_counter::get_half_units(size, is_quorum);
+                query_size.first += size;
+                processing_total_response_size += size;
+                if (processing_total_response_size <= max_response_size) query_size.second++;
+
                 // Update item size only if the item exists.
                 if (size > 0) {
                     per_table_stats->operation_sizes.batch_get_item_op_size_kb.add(bytes_to_kb_ceil(size));
                 }
             };
-            future<std::vector<rjson::value>> f = _proxy.query(rs.schema, std::move(command), std::move(partition_ranges), rs.cl,
-                    service::storage_proxy::coordinator_query_options(executor::default_timeout(), permit, client_state, trace_state)).then(
-                    [schema = rs.schema, partition_slice = std::move(partition_slice), selection = std::move(selection), attrs_to_get = rs.attrs_to_get, item_callback = std::move(item_callback)] (service::storage_proxy::coordinator_query_result qr) mutable {
-                utils::get_local_injector().inject("alternator_batch_get_item", [] { throw std::runtime_error("batch_get_item injection"); });
-                return describe_multi_item(std::move(schema), std::move(partition_slice), std::move(selection), std::move(qr.query_result), std::move(attrs_to_get), std::move(item_callback));
-            });
-            response_futures.push_back(std::move(f));
+            auto units = co_await seastar::get_units(read_concurrency_sem, 1);
+            if (processing_total_response_size > max_response_size) {
+                // no point starting futures, when we already know we exceeded the response size limit.
+                response_futures.push_back(make_ready_future<std::vector<rjson::value>>(std::vector<rjson::value>{}));
+            }
+            else {
+                future<std::vector<rjson::value>> f = _proxy.query(rs.schema, std::move(command), std::move(partition_ranges), rs.cl,
+                        service::storage_proxy::coordinator_query_options(executor::default_timeout(), permit, client_state, trace_state)).then(
+                        [schema = rs.schema, partition_slice = std::move(partition_slice), selection = std::move(selection), attrs_to_get = rs.attrs_to_get, item_callback = std::move(item_callback), units = std::move(units)] (service::storage_proxy::coordinator_query_result qr) mutable {
+                    utils::get_local_injector().inject("alternator_batch_get_item", [] { throw std::runtime_error("batch_get_item injection"); });
+                    // units is released when this lambda is destroyed, after the
+                    // future completes, allowing the next query to proceed.
+                    return describe_multi_item(std::move(schema), std::move(partition_slice), std::move(selection), std::move(qr.query_result), std::move(attrs_to_get), std::move(item_callback));
+                });
+                response_futures.push_back(std::move(f));
+            }
         }
     }
 
@@ -4919,44 +4964,77 @@ future<executor::request_return_type> executor::batch_get_item(client_state& cli
     rjson::add(response, "Responses", rjson::empty_object());
     rjson::add(response, "UnprocessedKeys", rjson::empty_object());
     auto fut_it = response_futures.begin();
+    auto size_it = per_query_item_sizes.begin();
     rjson::value consumed_capacity = rjson::empty_array();
+
+    // Helper lambda to add keys from a partition to UnprocessedKeys
+    // We don't create an array if we've have no data to add to it as spec requires that UnprocessedKeys should be empty if there are no unprocessed keys.
+    auto add_to_unprocessed = [&response, &request_items](const std::string& table, const auto& cks, size_t start_index = 0) {
+        if (start_index >= cks.size()) {
+            return;
+        }
+        if (!response["UnprocessedKeys"].HasMember(table)) {
+            // Add the table's entry in UnprocessedKeys. Need to copy
+            // all the table's parameters from the request except the
+            // Keys field, which we start empty and then build below.
+            rjson::add_with_string_name(response["UnprocessedKeys"], table, rjson::empty_object());
+            rjson::value& unprocessed_item = response["UnprocessedKeys"][table];
+            rjson::value& request_item = request_items[table];
+            for (auto it = request_item.MemberBegin(); it != request_item.MemberEnd(); ++it) {
+                if (it->name != "Keys") {
+                    rjson::add_with_string_name(unprocessed_item,
+                        rjson::to_string_view(it->name), rjson::copy(it->value));
+                }
+            }
+            rjson::add_with_string_name(unprocessed_item, "Keys", rjson::empty_array());
+        }
+        auto &array = response["UnprocessedKeys"][table]["Keys"];
+        for (auto& ck : cks) {
+            if (start_index > 0) {
+                --start_index;
+                continue;
+            }
+            rjson::push_back(array, std::move(*ck.second));
+        }
+    };
+    // Helper almbda to add itesm from a `items` array to final `Response` object.
+    // We always create an array for the table in Response, even if we don't add any items to it,
+    // because spec requires that Responses should contain an entry for each table mentioned in the request.
+    auto add_to_processed = [&response](const std::string& table, std::vector<rjson::value>&& items, size_t end_index = std::numeric_limits<size_t>::max()) {
+        if (!response["Responses"].HasMember(table)) {
+            rjson::add_with_string_name(response["Responses"], table, rjson::empty_array());
+        }
+        auto &array = response["Responses"][table];
+        for (rjson::value& json : items) {
+            if (end_index == 0) {
+                break;
+            }
+            --end_index;
+            rjson::push_back(array, std::move(json));
+        }
+    };
+
     for (size_t i = 0; i < requests.size(); i++) {
         const table_requests& rs = requests[i];
         std::string table = table_name(*rs.schema);
         for (const auto& [_, cks] : rs.requests) {
-            auto& fut = *fut_it;
-            ++fut_it;
+            auto& fut = *fut_it++;
             try {
                 std::vector<rjson::value> results = co_await std::move(fut);
-                some_succeeded = true;
-                if (!response["Responses"].HasMember(table)) {
-                    rjson::add_with_string_name(response["Responses"], table, rjson::empty_array());
+                // NOTE: we need to wait for future to complete, because it will update query item size and accepted count
+                // accepted count can range from 0 to cks.size() inclusive.
+                // Both helpers will accept the same accepted count, but for different purposes - add_to_processed will add accepted count of items to final response,
+                // while add_to_unprocessed will add remaining items to UnprocessedKeys.
+                auto [ query_item_size, query_item_accepted_count ] = *size_it++;
+                if (query_item_accepted_count > 0) {
+                    some_succeeded = true;
                 }
-                for (rjson::value& json : results) {
-                    rjson::push_back(response["Responses"][table], std::move(json));
-                }
+                add_to_processed(table, std::move(results), query_item_accepted_count);
+                add_to_unprocessed(table, cks, query_item_accepted_count);
             } catch(...) {
                 eptr = std::current_exception();
-                // This read of potentially several rows in one partition,
-                // failed. We need to add the row key(s) to UnprocessedKeys.
-                if (!response["UnprocessedKeys"].HasMember(table)) {
-                    // Add the table's entry in UnprocessedKeys. Need to copy
-                    // all the table's parameters from the request except the
-                    // Keys field, which we start empty and then build below.
-                    rjson::add_with_string_name(response["UnprocessedKeys"], table, rjson::empty_object());
-                    rjson::value& unprocessed_item = response["UnprocessedKeys"][table];
-                    rjson::value& request_item = request_items[table];
-                    for (auto it = request_item.MemberBegin(); it != request_item.MemberEnd(); ++it) {
-                        if (it->name != "Keys") {
-                            rjson::add_with_string_name(unprocessed_item,
-                                rjson::to_string_view(it->name), rjson::copy(it->value));
-                        }
-                    }
-                    rjson::add_with_string_name(unprocessed_item, "Keys", rjson::empty_array());
-                }
-                for (auto& ck : cks) {
-                    rjson::push_back(response["UnprocessedKeys"][table]["Keys"], std::move(*ck.second));
-                }
+                // Read of potentially several rows in one partition failed. We need to add the row key(s) to UnprocessedKeys.
+                add_to_unprocessed(table, cks);
             }
         }
         uint64_t rcu_half_units = consumed_rcu_half_units_per_table[i];
