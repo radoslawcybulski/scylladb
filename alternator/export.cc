@@ -23,6 +23,7 @@
 #include "service/storage_proxy.hh"
 #include "service_permit.hh"
 #include "utils/log.hh"
+#include "abseil/absl/functional/overload.h"
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/gate.hh>
 #include <seastar/core/sleep.hh>
@@ -335,7 +336,6 @@ public:
     }
 };
 
-
 future<> scan_table(
     service::storage_proxy& proxy,
     schema_ptr schema,
@@ -404,6 +404,123 @@ future<> scan_table(
             co_await cb(std::move(item));
         }
     }
+}
+
+/// Writes data to an S3 object. Each write() call uploads data immediately.
+class s3_storage_sink : public storage_sink_interface {
+    seastar::shared_ptr<s3::client> _client;
+    seastar::sstring _object_name;
+    seastar::output_stream<char> _upload_stream;
+
+public:
+    s3_storage_sink(seastar::shared_ptr<s3::client> client, seastar::sstring object_name)
+        : _client(std::move(client))
+        , _object_name(std::move(object_name))
+        , _upload_stream(seastar::output_stream<char>(_client->make_upload_sink(_object_name)))
+    {
+    }
+
+    seastar::future<> write(std::span<const std::byte> data) override {
+        // we will return the future from write() directly, no need to add `co_await` here.
+        return _upload_stream.write(reinterpret_cast<const char*>(data.data()), data.size());
+    }
+
+    seastar::future<> flush_and_close() override {
+        co_await _upload_stream.flush();
+        co_await _upload_stream.close();
+    }
+};
+
+/// Reads data from an S3 object and feeds it through a decompression_interface.
+/// read() streams the entire object, calling decompress() for each chunk,
+/// then calls decompression_interface::flush_and_close().
+class s3_storage_source : public import_pipeline_interface {
+    seastar::shared_ptr<s3::client> _client;
+    seastar::sstring _object_name;
+    std::unique_ptr<decompression_interface> _decompressor;
+
+public:
+    s3_storage_source(seastar::shared_ptr<s3::client> client, seastar::sstring object_name,
+                      std::unique_ptr<decompression_interface> decompressor)
+        : _client(std::move(client))
+        , _object_name(std::move(object_name))
+        , _decompressor(std::move(decompressor))
+    {
+    }
+
+    seastar::future<> read() override {
+        auto input = seastar::input_stream<char>(
+            _client->make_download_source(_object_name));
+        while (true) {
+            auto buf = co_await input.read();
+            if (buf.empty()) {
+                break;
+            }
+            co_await _decompressor->decompress(
+                std::span<const std::byte>(reinterpret_cast<const std::byte*>(buf.get()), buf.size()));
+        }
+        co_await input.close();
+    }
+    seastar::future<> flush_and_close() override {
+        co_await _decompressor->flush_and_close();
+    }
+};
+
+static std::unique_ptr<export_pipeline_interface>  create_export_pipeline(std::unique_ptr<storage_sink_interface> sink) {
+    auto compressor = std::make_unique<noop_compressor>(std::move(sink));
+    return std::make_unique<json_formatter>(std::move(compressor));
+}
+
+static std::unique_ptr<decompression_interface> create_decompression_pipeline(std::function<seastar::future<>(rjson::value)> on_item) {
+    auto parser = std::make_unique<json_parser>(std::move(on_item));
+    return std::make_unique<noop_decompressor>(std::move(parser));
+}
+
+// Factory function to create sink pipeline. Depending on target_config it will be either
+// - in_memory_target_config - in-memory sink pipeline for testing.
+// - s3_target_config - pipeline that will write to S3 object.
+std::unique_ptr<export_pipeline_interface> create_sink_pipeline(std::variant<in_memory_target_config, s3_target_config> target_config, compression_type compression_config) {
+    auto write_sink = std::visit(absl::Overload{
+        [](in_memory_target_config &cfg) -> std::unique_ptr<storage_sink_interface> {
+            return std::make_unique<in_memory_storage_sink>(cfg.storage);
+        },
+        [](s3_target_config &cfg) -> std::unique_ptr<storage_sink_interface> {
+            return std::make_unique<s3_storage_sink>(std::move(cfg.client), std::move(cfg.object_name));
+        }
+    }, target_config);
+    auto compressor = std::visit(absl::Overload{
+        [&](no_compression cfg) -> std::unique_ptr<compression_interface> {
+            return std::make_unique<noop_compressor>(std::move(write_sink));
+        },
+        [&](gzip_compression cfg) -> std::unique_ptr<compression_interface> {
+            return std::make_unique<gzip_compressor>(std::move(write_sink));
+        }
+    }, compression_config);
+    return std::make_unique<json_formatter>(std::move(compressor));
+}
+
+// Factory function to create source pipeline. Depending on target_config it will be either
+// - in_memory_target_config - in-memory source pipeline for testing.
+// - s3_target_config - pipeline that will read from S3 object.
+std::unique_ptr<import_pipeline_interface> create_source_pipeline(std::variant<in_memory_target_config, s3_target_config> target_config, compression_type compression_config, std::function<seastar::future<>(rjson::value)> on_item) {
+    auto parser = std::make_unique<json_parser>(std::move(on_item));
+    auto decompressor = std::visit(absl::Overload{
+        [&](no_compression cfg) -> std::unique_ptr<decompression_interface> {
+            return std::make_unique<noop_decompressor>(std::move(parser));
+        },
+        [&](gzip_compression cfg) -> std::unique_ptr<decompression_interface> {
+            return std::make_unique<gzip_decompressor>(std::move(parser));
+        }
+    }, compression_config);
+
+    return std::visit(absl::Overload{
+        [&](in_memory_target_config &cfg) -> std::unique_ptr<import_pipeline_interface> {
+            return std::make_unique<in_memory_source>(cfg.storage, std::move(decompressor));
+        },
+        [&](s3_target_config &cfg) -> std::unique_ptr<import_pipeline_interface> {
+            return std::make_unique<s3_storage_source>(std::move(cfg.client), std::move(cfg.object_name), std::move(decompressor));
+        }
+    }, target_config);
 }
 
 future<executor::request_return_type> executor::export_table_to_point_in_time(client_state& client_state, service_permit permit, rjson::value request, std::unique_ptr<audit::audit_info_alternator>& audit_info) {
