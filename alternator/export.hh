@@ -16,6 +16,8 @@
 #include <seastar/core/future.hh>
 #include "utils/rjson.hh"
 
+namespace s3 { class client; }
+
 namespace alternator {
 
 // An interface encapsulating sink pipeline stage for exporting data via DynamoDB export api (ExportTableToPointInTime call).
@@ -86,5 +88,12 @@ std::unique_ptr<export_pipeline_interface> create_in_memory_sink_pipeline(in_mem
 // You should not use in_memory_debug_storage object for sink and storage simultaneously -
 // write first, then flush, then read.
 std::unique_ptr<import_pipeline_interface> create_in_memory_source_pipeline(in_memory_debug_storage &, std::function<seastar::future<>(rjson::value)> on_item);
+
+
+// Create s3 sink pipeline for a single file.
+std::unique_ptr<export_pipeline_interface> create_s3_sink_pipeline(seastar::shared_ptr<s3::client> client, seastar::sstring object_name);
+
+// Create s3 source pipeline for a single file.
+std::unique_ptr<import_pipeline_interface> create_s3_source_pipeline(seastar::shared_ptr<s3::client> client, seastar::sstring object_name, std::function<seastar::future<>(rjson::value)> on_item);
 
 } // namespace alternator
