@@ -9,21 +9,33 @@
 #include "alternator/export.hh"
 #include "alternator/executor.hh"
 #include "alternator/executor_util.hh"
+#include "alternator/error.hh"
 #include "alternator/serialization.hh"
 #include "cql3/selection/selection.hh"
 #include "cql3/result_set.hh"
+#include "cql3/untyped_result_set.hh"
+#include "db/system_distributed_keyspace.hh"
+#include "gms/gossiper.hh"
 #include "query/query-request.hh"
 #include "schema/schema.hh"
 #include "service/client_state.hh"
 #include "service/pager/query_pagers.hh"
 #include "service/storage_proxy.hh"
 #include "service_permit.hh"
+#include "utils/log.hh"
 #include <seastar/core/coroutine.hh>
+#include <seastar/core/gate.hh>
+#include <seastar/core/sleep.hh>
 #include <seastar/coroutine/maybe_yield.hh>
 #include "utils/rjson.hh"
+#include "utils/s3/client.hh"
 #include <algorithm>
+#include <array>
+#include <cstring>
+#include <random>
 #include <string>
 #include <string_view>
+#include <zlib.h>
 
 
 namespace alternator {
@@ -105,6 +117,73 @@ public:
     }
 };
 
+// Gzip compressor - compresses data using gzip format and writes compressed chunks to the storage sink.
+// Not every call to compress() produces output; zlib may buffer data internally.
+// All data is guaranteed to be flushed when flush_and_close() is called.
+class gzip_compressor : public compression_interface {
+    std::unique_ptr<storage_sink_interface> _sink;
+    z_stream _zs;
+    static constexpr size_t _buf_size = 4096;
+
+public:
+    explicit gzip_compressor(std::unique_ptr<storage_sink_interface> sink)
+        : _sink(std::move(sink)) {
+        memset(&_zs, 0, sizeof(_zs));
+        if (deflateInit2(&_zs, Z_DEFAULT_COMPRESSION, Z_DEFLATED,
+                16 + MAX_WBITS, 8, Z_DEFAULT_STRATEGY) != Z_OK) {
+            throw std::bad_alloc();
+        }
+    }
+
+    ~gzip_compressor() {
+        deflateEnd(&_zs);
+    }
+
+    seastar::future<> compress(std::span<const std::byte> data) override {
+        _zs.next_in = reinterpret_cast<Bytef*>(const_cast<std::byte*>(data.data()));
+        _zs.avail_in = static_cast<uInt>(data.size());
+
+        do {
+            std::array<std::byte, _buf_size> output;
+            _zs.next_out = reinterpret_cast<Bytef*>(output.data());
+            _zs.avail_out = _buf_size;
+
+            int ret = deflate(&_zs, Z_NO_FLUSH);
+            if (ret < Z_OK) {
+                throw std::runtime_error("gzip compression error");
+            }
+
+            auto produced = _buf_size - _zs.avail_out;
+            if (produced > 0) {
+                co_await _sink->write(std::span<const std::byte>(output.data(), produced));
+            }
+        } while (_zs.avail_in > 0 || _zs.avail_out == 0);
+    }
+
+    seastar::future<> flush_and_close() override {
+        int ret;
+        do {
+            std::array<std::byte, _buf_size> output;
+            _zs.next_out = reinterpret_cast<Bytef*>(output.data());
+            _zs.avail_out = _buf_size;
+            _zs.next_in = nullptr;
+            _zs.avail_in = 0;
+
+            ret = deflate(&_zs, Z_FINISH);
+            if (ret < Z_OK) {
+                throw std::runtime_error("gzip compression flush error");
+            }
+
+            auto produced = _buf_size - _zs.avail_out;
+            if (produced > 0) {
+                co_await _sink->write(std::span<const std::byte>(output.data(), produced));
+            }
+        } while (ret != Z_STREAM_END);
+
+        co_await _sink->flush_and_close();
+    }
+};
+
 // Formatter that converts rjson::value item to single JSON line and passes it to the compressor.
 // The line is terminated with a newline character, so that the source pipeline can parse it line by line.
 class json_formatter : public export_pipeline_interface {
@@ -171,6 +250,55 @@ public:
     }
 };
 
+// Gzip decompressor - decompresses gzip data and passes decompressed chunks to the parser.
+class gzip_decompressor : public decompression_interface {
+    std::unique_ptr<parsing_interface> _parser;
+    z_stream _zs;
+    static constexpr size_t _buf_size = 4096;
+
+public:
+    explicit gzip_decompressor(std::unique_ptr<parsing_interface> parser)
+        : _parser(std::move(parser)) {
+        memset(&_zs, 0, sizeof(_zs));
+        if (inflateInit2(&_zs, 16 + MAX_WBITS) != Z_OK) {
+            throw std::bad_alloc();
+        }
+    }
+
+    ~gzip_decompressor() {
+        inflateEnd(&_zs);
+    }
+
+    seastar::future<> decompress(std::span<const std::byte> data) override {
+        _zs.next_in = reinterpret_cast<Bytef*>(const_cast<std::byte*>(data.data()));
+        _zs.avail_in = static_cast<uInt>(data.size());
+
+        do {
+            std::array<std::byte, _buf_size> output;
+            _zs.next_out = reinterpret_cast<Bytef*>(output.data());
+            _zs.avail_out = _buf_size;
+
+            int ret = inflate(&_zs, Z_NO_FLUSH);
+            if (ret != Z_OK && ret != Z_STREAM_END && ret != Z_BUF_ERROR) {
+                throw std::runtime_error("gzip decompression error");
+            }
+
+            auto produced = _buf_size - _zs.avail_out;
+            if (produced > 0) {
+                co_await _parser->parse(std::span<const std::byte>(output.data(), produced));
+            }
+
+            if (ret == Z_STREAM_END) {
+                co_return;
+            }
+        } while (_zs.avail_in > 0 || _zs.avail_out == 0);
+    }
+
+    seastar::future<> flush_and_close() override {
+        co_await _parser->flush_and_close();
+    }
+};
+
 // Json parser that accumulates incoming data until it sees a newline character,
 // then parses the accumulated line as JSON and invokes the on_item callback with the parsed rjson::value.
 // The last line is parsed and sent to callback even if it doesn't end with a newline.
@@ -206,20 +334,6 @@ public:
         co_return;
     }
 };
-
-// Factory function to create in-memory sink pipeline for testing (no compression, JSON formatter).
-std::unique_ptr<export_pipeline_interface> create_in_memory_sink_pipeline(in_memory_test_storage& storage) {
-    auto sink = std::make_unique<in_memory_storage_sink>(storage);
-    auto compressor = std::make_unique<noop_compressor>(std::move(sink));
-    return std::make_unique<json_formatter>(std::move(compressor));
-}
-
-// Factory function to create in-memory source pipeline for testing (no compression, JSON parser).
-std::unique_ptr<import_pipeline_interface> create_in_memory_source_pipeline(in_memory_test_storage& storage, std::function<seastar::future<>(rjson::value)> on_item) {
-    auto parser = std::make_unique<json_parser>(std::move(on_item));
-    auto decompressor = std::make_unique<noop_decompressor>(std::move(parser));
-    return std::make_unique<in_memory_source>(storage, std::move(decompressor));
-}
 
 
 future<> scan_table(
