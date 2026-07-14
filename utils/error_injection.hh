@@ -416,6 +416,18 @@ public:
         return true;
     }
 
+    bool enter_if_parameter_equals(std::string_view name, std::string_view param_name, std::string_view param_value) {
+        if (!is_enabled(name)) {
+            return false;
+        }
+        auto* data = get_data(name);
+        auto it = data->shared_data->parameters.find(param_name);
+        if (it == data->shared_data->parameters.end() || it->second != param_value) {
+            return false;
+        }
+        return enter(name);
+    }
+
     void enable(const std::string_view& injection_name, bool one_shot = false, error_injection_parameters parameters = {}) {
         auto data = injection_data{one_shot, std::move(parameters), injection_name};
         std::string_view name = data.shared_data->injection_name;
@@ -504,7 +516,7 @@ public:
         }
         errinj_logger.debug("Triggering abortable sleep injection \"{}\" ({}ms)", name, duration.count());
         return seastar::sleep_abortable(duration, as);
-    }    
+    }
 
     // \brief Inject a sleep to deadline (timeout)
     template <typename Clock, typename Duration>
