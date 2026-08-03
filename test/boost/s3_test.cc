@@ -9,6 +9,8 @@
 
 #include <unordered_set>
 #include <regex>
+#include <string>
+#include <vector>
 #include <boost/test/unit_test.hpp>
 #include <boost/algorithm/string/split.hpp>
 #include <boost/algorithm/string/classification.hpp>
@@ -37,6 +39,8 @@
 #include "utils/s3/credentials_providers/instance_profile_credentials_provider.hh"
 #include "utils/s3/credentials_providers/sts_assume_role_credentials_provider.hh"
 #include "sstables/checksum_utils.hh"
+#include "alternator/export.hh"
+#include "utils/rjson.hh"
 #include "gc_clock.hh"
 
 using namespace std::string_view_literals;
@@ -790,6 +794,128 @@ SEASTAR_THREAD_TEST_CASE(test_small_object_copy_proxy) {
 
 SEASTAR_THREAD_TEST_CASE(test_large_object_copy_proxy) {
     test_object_copy(make_proxy_client, 1_MiB, 6);
+}
+
+/*
+ * Alternator export pipeline (alternator/export.hh) over S3.
+ *
+ * The sink pipeline serializes items as JSON lines into an S3 object via
+ * s3_storage_sink, the source pipeline reads them back via s3_storage_source.
+ * test/boost/alternator_export_test.cc covers the same roundtrip over the
+ * in-memory storage, but only a real S3 server exercises the multipart upload
+ * and the chunked download paths, which is what these tests are for.
+ */
+
+// Builds a deterministic export item. `payload_size` is the size of the "value"
+// attribute, which lets a test control whether the resulting object stays below
+// or crosses s3::minimum_part_size. The payload depends on the index, so items
+// delivered out of order or duplicated are detected.
+static rjson::value make_export_item(unsigned index, size_t payload_size) {
+    auto item = rjson::empty_object();
+    rjson::add(item, "id", index);
+
+    std::string payload;
+    payload.reserve(payload_size + 32);
+    while (payload.size() < payload_size) {
+        payload += fmt::format("item-{}-at-{}:", index, payload.size());
+    }
+    payload.resize(payload_size);
+    // from_string() copies. Passing the std::string directly would select the
+    // rjson::add(..., string_ref_type) overload, which merely stores a
+    // reference to this local buffer.
+    rjson::add(item, "value", rjson::from_string(payload));
+
+    return item;
+}
+
+void alternator_export_s3_roundtrip(const client_maker_function& client_maker, unsigned item_count, size_t payload_size) {
+    s3_test_fixture guard(client_maker);
+    auto cln = guard.client();
+    const auto object_name = guard.object_path("alternator-export");
+
+    std::vector<rjson::value> items;
+    items.reserve(item_count);
+    for (unsigned i = 0; i < item_count; i++) {
+        items.push_back(make_export_item(i, payload_size));
+    }
+
+    testlog.info("Exporting {} items with {}-byte payloads to {}", item_count, payload_size, object_name);
+    {
+        auto sink = alternator::create_sink_pipeline(alternator::s3_target_config{cln, object_name});
+        for (const auto& item : items) {
+            sink->process(item).get();
+        }
+        // Mandatory: this is what completes the (possibly multipart) upload and
+        // makes the object visible in the bucket.
+        sink->flush_and_close().get();
+    }
+
+    const size_t object_size = cln->get_object_size(object_name).get();
+    testlog.info("Exported object {} is {} bytes", object_name, object_size);
+    // Every item is written as one JSON line, so the object is at least as large
+    // as the raw payloads plus one newline per item.
+    BOOST_REQUIRE_GT(object_size, item_count * (payload_size + 1));
+
+    std::vector<rjson::value> received;
+    received.reserve(item_count);
+    auto source = alternator::create_source_pipeline(alternator::s3_target_config{cln, object_name}, [&received](rjson::value v) -> future<> {
+        received.push_back(std::move(v));
+        return make_ready_future<>();
+    });
+    source->read_all().get();
+    source->close().get();
+
+    BOOST_REQUIRE_EQUAL(received.size(), items.size());
+    for (size_t i = 0; i < items.size(); i++) {
+        // Compare without BOOST_REQUIRE_EQUAL, which would dump both (large)
+        // payloads into the log on mismatch.
+        BOOST_REQUIRE_MESSAGE(rjson::print(received[i]) == rjson::print(items[i]), format("item {} differs after the S3 roundtrip", i));
+    }
+}
+
+// Small export: the whole object fits well below s3::minimum_part_size (5 MiB),
+// so it is uploaded as a single part.
+SEASTAR_THREAD_TEST_CASE(test_alternator_export_s3_roundtrip_single_part_minio) {
+    alternator_export_s3_roundtrip(make_minio_client, 16, 1_KiB);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_alternator_export_s3_roundtrip_single_part_proxy) {
+    alternator_export_s3_roundtrip(make_proxy_client, 16, 1_KiB);
+}
+
+// Large export: ~6 MiB of payload crosses s3::minimum_part_size, so the sink
+// performs a real multipart upload and the source pages the object back with
+// several chunked download requests. Kept just above the threshold so it stays
+// cheap in debug builds.
+SEASTAR_THREAD_TEST_CASE(test_alternator_export_s3_roundtrip_multipart_minio) {
+    alternator_export_s3_roundtrip(make_minio_client, 96, 64_KiB);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_alternator_export_s3_roundtrip_multipart_proxy) {
+    alternator_export_s3_roundtrip(make_proxy_client, 96, 64_KiB);
+}
+
+// Exporting no items at all currently creates no S3 object whatsoever: the sink
+// never writes a byte, so s3::client::upload_sink::flush() has nothing to PUT
+// and never starts a multipart upload. This test pins that behaviour down,
+// because a DynamoDB-compatible ExportTableToPointInTime most likely wants an
+// empty-but-present data file instead. If the sink is changed to always create
+// the object, update this test deliberately.
+void alternator_export_s3_empty(const client_maker_function& client_maker) {
+    s3_test_fixture guard(client_maker);
+    auto cln = guard.client();
+    const auto object_name = guard.object_path("alternator-export-empty");
+
+    auto sink = alternator::create_sink_pipeline(alternator::s3_target_config{cln, object_name});
+    sink->flush_and_close().get();
+
+    BOOST_REQUIRE_EXCEPTION(cln->get_object_size(object_name).get(), storage_io_error, [](const storage_io_error& e) {
+        return e.code().value() == ENOENT;
+    });
+}
+
+SEASTAR_THREAD_TEST_CASE(test_alternator_export_s3_empty_minio) {
+    alternator_export_s3_empty(make_minio_client);
 }
 
 SEASTAR_THREAD_TEST_CASE(test_creds) {

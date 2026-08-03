@@ -224,7 +224,9 @@ add_scylla_test(rust_test
   LIBRARIES inc)
 add_scylla_test(s3_test
   KIND SEASTAR
-  LIBRARIES scylla_encryption)
+  LIBRARIES
+    scylla_encryption
+    alternator)
 add_scylla_test(gcp_object_storage_test
   KIND SEASTAR
   LIBRARIES scylla_encryption)
