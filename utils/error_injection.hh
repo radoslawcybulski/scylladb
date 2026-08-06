@@ -416,7 +416,7 @@ public:
         return true;
     }
 
-    bool enter_if_parameter_equals(std::string_view name, std::string_view param_name, std::string_view param_value) {
+    bool enter_if_parameter_equals(std::string_view name, const sstring &param_name, std::string_view param_value) {
         if (!is_enabled(name)) {
             return false;
         }
@@ -702,6 +702,11 @@ public:
     }
 
     bool enter(const std::string_view& name) const {
+        return false;
+    }
+
+    [[gnu::always_inline]]
+    bool enter_if_parameter_equals(std::string_view name, const sstring &param_name, std::string_view param_value) {
         return false;
     }
 
