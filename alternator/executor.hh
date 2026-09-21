@@ -137,7 +137,7 @@ class executor : public peering_sharded_service<executor> {
     future<> garbage_collector_for_s3_exports();
 
     // Returns list of alive nodes in the cluster, based on gossip information.
-    future<std::vector<locator::host_id>> get_live_nodes();
+    future<std::unordered_set<sstring>> get_live_nodes();
 
     // Returns this node's ID in the format "{host_id}:{gossip_generation}".
     // The value is unique. The value will change after reboot (gossip_generation will increase).

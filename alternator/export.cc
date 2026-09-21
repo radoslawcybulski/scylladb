@@ -42,7 +42,7 @@
 
 namespace alternator {
 
-logging::logger elogger("alternator-export");
+static logging::logger elogger("alternator-export");
 
 // Interfaces for `sink` / `source` pipelines.
 // The `sink` pipeline consists of 3 stages:
@@ -469,16 +469,6 @@ public:
     }
 };
 
-static std::unique_ptr<export_pipeline_interface>  create_export_pipeline(std::unique_ptr<storage_sink_interface> sink) {
-    auto compressor = std::make_unique<noop_compressor>(std::move(sink));
-    return std::make_unique<json_formatter>(std::move(compressor));
-}
-
-static std::unique_ptr<decompression_interface> create_decompression_pipeline(std::function<seastar::future<>(rjson::value)> on_item) {
-    auto parser = std::make_unique<json_parser>(std::move(on_item));
-    return std::make_unique<noop_decompressor>(std::move(parser));
-}
-
 // Factory function to create sink pipeline. Depending on target_config it will be either
 // - in_memory_target_config - in-memory sink pipeline for testing.
 // - s3_target_config - pipeline that will write to S3 object.
@@ -537,6 +527,21 @@ sstring executor::get_self_node_id() {
     return fmt::format("{}:{}", host_id, generation.value());
 }
 
+future<std::unordered_set<sstring>> executor::get_live_nodes() {
+    auto live_members = _gossiper.get_live_members();
+    std::unordered_set<sstring> result;
+    result.reserve(live_members.size());
+    for (const auto& host_id : live_members) {
+        auto ep_state = _gossiper.get_endpoint_state_ptr(host_id);
+        if (!ep_state) {
+            continue;
+        }
+        auto generation = ep_state->get_heart_beat_state().get_generation();
+        result.insert(fmt::format("{}:{}", host_id, generation.value()));
+    }
+    co_return result;
+}
+
 static locator::host_id get_host_id_from_node_id(const sstring& node_id) {
     auto pos = node_id.find(':');
     if (pos == sstring::npos) {
@@ -572,11 +577,11 @@ static sstring canonicalize_request(const rjson::value& request) {
 // Generate random hex string of specified length (in hex chars).
 static sstring generate_random_hex(size_t hex_chars) {
     static thread_local std::mt19937 rng(std::random_device{}());
-    static constexpr char hex_digits[] = "0123456789abcdef";
+    static constexpr std::string_view characters = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
     sstring result;
     result.resize(hex_chars);
     for (size_t i = 0; i < hex_chars; ++i) {
-        result[i] = hex_digits[rng() % 16];
+        result[i] = characters[rng() % characters.size()];
     }
     return result;
 }
@@ -827,7 +832,7 @@ future<executor::request_return_type> executor::export_table_to_point_in_time(cl
     }
 
     // ClientToken - for idempotency
-    auto client_token = get_non_empty_string_attribute(request, "ClientToken", "");
+    auto user_client_token = get_non_empty_string_attribute(request, "ClientToken", "");
 
     // S3BucketOwner - accepted but not used
     auto s3_bucket_owner = get_non_empty_string_attribute(request, "S3BucketOwner", "");
@@ -856,10 +861,10 @@ future<executor::request_return_type> executor::export_table_to_point_in_time(cl
     }
 
     // Generate export_id_token (random identifier used in S3 key paths)
-    auto export_id_token = generate_random_hex(8);
+    auto export_id_token = generate_random_hex(16);
 
     // Generate a unique export ARN
-    auto export_arn = generate_export_arn(sstring(parts.table_name));
+    auto export_arn = generate_export_arn(parts.keyspace_name, parts.table_name);
 
     // Build the S3 key prefix for this export
     auto s3_key_prefix = s3_prefix.empty()
@@ -880,22 +885,23 @@ future<executor::request_return_type> executor::export_table_to_point_in_time(cl
 
     // We have all we need, let's publish the export request to the database.
     // We need to do this in two steps - first insert a client token row, then insert the export metadata row.
-    // The order matters, because it's possible that another node is running the export with the same client token -
-    // export metadata table is keyed by export_arn, which contains a random suffix and we can't use it to detect this situation. 
+    // The order matters, because it's possible that another node is running the export with the same client token,
+    // in which case we need to handle one of such requests as duplicate (we can't start two exports with the same client token).
+    // We check for client token in client token table first (and we insert the row first as well),
+    // only one node can succeed in inserting the client token row (insert-if-not-exists mechanic) and that node will
+    // continue to run the export.
     auto [ client_row, client_token_inserted ] = co_await get_or_insert_client_row(_qp, client_token);
 
-    // We define it early because of `goto` later on.
-    bool export_row_inserted = false;
-    export_row erow;
-
     if (!client_token_inserted) {
+        // Export with this client token already exists. We need to check if request is the same or different.
+        // If the same - return the export is in progress (or completed or failed) as if DescribeExport was called.
+        // If not the same - return export conflict error as Amazon requires us to do.
+
         elogger.debug("ClientToken {} already exists", client_token);
-        // Export with this client token already exists. Check if the request matches.
         if (canonical_request != client_row.request) {
-            // Easy - different request, so we fail with export conflict as Amazon requires us.
+            // Easy - different request, so we fail with export conflict as Amazon requires.
             elogger.debug("Export conflict: different parameters");
-            co_return api_error::export_conflict(
-                "An export with this ClientToken already exists with different parameters");
+            co_return api_error::export_conflict("An export with this ClientToken already exists with different parameters");
         }
 
         // We need an export row for this client token - the export might be in progress or completed or failed.
@@ -906,6 +912,7 @@ future<executor::request_return_type> executor::export_table_to_point_in_time(cl
             // - the other node is doing the export in the same moment and hasn't inserted the export row yet (but managed
             //   to insert client token row first), or
             // - the other node doing the export died before inserting the export row, leaving a dangling client token row
+            //   (it's possible the node is gone but we don't know it yet, so we can't be sure).
             // In both cases we will return IN_PROGRESS status - the dangling client token row will be taken care of by
             // garbage collection thread.
             elogger.debug("Returning IN_PROGRESS status for ClientToken {}", client_token);
@@ -918,33 +925,31 @@ future<executor::request_return_type> executor::export_table_to_point_in_time(cl
         co_return rjson::print(std::move(response));
     }
 
-    erow = {
-        .export_arn = export_arn,
-        .client_token = client_token,
-        .request = canonical_request,
-        .export_status = "IN_PROGRESS",
-        .export_id_token = export_id_token,
-        .accepted_at = accepted_at,
-        .completed_at = db_clock::time_point::min(),
-        .node_id = node_id,
-    };
-    export_row_inserted = co_await insert_export(_qp, erow);
+    // We need a scope here, because above is a `goto build_in_progress_response` and c++ doesn't allow jump over variable initialization,
+    // that is visible from the landing point of the goto. So we need to put the variable initialization in a separate scope to tell a compiler
+    // that those variables will be deleted before the landing point.
+    {
+        auto erow = export_row{
+            .export_arn = export_arn,
+            .client_token = client_token,
+            .request = canonical_request,
+            .export_status = "IN_PROGRESS",
+            .export_id_token = export_id_token,
+            .accepted_at = accepted_at,
+            .completed_at = db_clock::time_point::min(),
+            .node_id = node_id,
+        };
+        auto export_row_inserted = co_await insert_export(_qp, erow);
 
-    if (!export_row_inserted) {
-        // Another node inserted the export row concurrently.
-        // This should never happen, but since we got here we will return as if DescribeExport was called.
-        auto export_row = co_await get_export(_qp, client_row.export_arn);
-        if (!export_row) {
-            on_internal_error(elogger, fmt::format("Failed to insert export row for ClientToken {} and failed to read it back", client_token));
+        if (!export_row_inserted) {
+            elogger.debug("(?) Failed to insert export row for ClientToken {} and ExportArn {}", client_token, export_arn);
+            on_internal_error(elogger, fmt::format("Failed to insert export row for ClientToken {} and ExportArn {}", client_token, export_arn));
         }
-        auto response = build_export_description_response(*export_row);
-        elogger.debug("(?) Export row already exists - returning existing export description for ClientToken {}", client_token);
-        co_return rjson::print(std::move(response));
-    }
 
-    // Launch background export fiber (fire-and-forget, gate-guarded)
-    elogger.debug("Launching background export fiber for ClientToken {}", client_token);
-    (void)run_export(_export_gate.hold(), schema, std::move(erow), table_arn,s3_bucket, s3_key_prefix, export_id_token);
+        // Launch background export fiber (fire-and-forget, gate-guarded)
+        elogger.debug("Launching background export fiber for ClientToken {}", client_token);
+        (void)run_export(_export_gate.hold(), schema, std::move(erow), table_arn,s3_bucket, s3_key_prefix, export_id_token);
+    }
 
     // Build the ExportDescription response
 build_in_progress_response:
@@ -996,7 +1001,7 @@ future<> executor::run_export(
         auto data_object_key = fmt::format("{}data/{}.json.gz", s3_key_prefix, export_id_token);
 
         // Create S3 sink pipeline with gzip compression
-        auto pipeline = create_s3_sink_pipeline(client, data_object_key, gzip_compression{});
+        auto pipeline = create_sink_pipeline(s3_target_config{ client, data_object_key }, gzip_compression{});
 
         // Scan the table and feed items through the pipeline
         co_await scan_table(_proxy, schema, [&pipeline, &item_count](rjson::value item) -> future<> {
@@ -1101,7 +1106,7 @@ future<executor::request_return_type> executor::describe_export(client_state& cl
     co_return rjson::print(std::move(response));
 }
 
-static std::string get_table_arn_from_export_arn(std::string_view export_arn) {
+static std::string_view get_table_arn_from_export_arn(std::string_view export_arn) {
     // Expected format: arn:scylla:alternator:::table/<name>/export/<id>
     // or AWS format: arn:aws:dynamodb:<region>:<account>:table/<name>/export/<id>
     auto pos = export_arn.find("/export/");
@@ -1149,10 +1154,10 @@ future<executor::request_return_type> executor::list_exports(client_state& clien
     for (const auto& row : result) {
         // Filter by table_arn if specified
         auto table_arn = get_table_arn_from_export_arn(row.export_arn);
-        if (!table_arn_filter.empty() && row.table_arn != table_arn_filter) {
+        if (!table_arn_filter.empty() && table_arn != table_arn_filter) {
             continue;
         }
-        summaries.push_back({row.export_arn, row.export_status, row.table_arn});
+        summaries.push_back({row.export_arn, row.export_status, sstring{ table_arn }});
     }
 
     // Sort by export_arn ascending
